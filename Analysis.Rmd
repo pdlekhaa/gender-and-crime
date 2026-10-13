@@ -1,3 +1,15 @@
+---
+format:
+  html:
+    toc: true
+    code-fold: true
+    theme: default
+    viewer: true       # show in RStudio side panel
+  pdf:
+    documentclass: article
+editor: visual
+---
+
 ## EDA / Data Cleaning
 ```{r chunk-name, echo=FALSE, results='hide', message=FALSE, warning=FALSE}
 #install.packages('psych')
