@@ -1,0 +1,1052 @@
+---
+format:
+  html:
+    toc: true
+    code-fold: true
+    theme: default
+    viewer: true       # show in RStudio side panel
+  pdf:
+    documentclass: article
+    keep-tex: true
+    execute:
+      warning: false
+      message: false
+editor: visual
+#run quarto render EDA.qmd --to pdf
+---
+
+```{r}
+#| label: setup
+#| include: false
+
+knitr::opts_chunk$set(
+  message = FALSE,
+  warning = FALSE
+)
+```
+
+
+## EDA / Data Cleaning
+```{r chunk-name, echo=FALSE, results='hide', message=FALSE, warning=FALSE}
+#install.packages('psych')
+#install.packages('tidyverse')
+#install.packages('bayesplot')
+#install.packages('HDInterval')
+#install.packages('gridExtra')
+#install.packages('ggpubr')
+#install.packages('posterior')
+#install.packages(rstan)
+
+.libPaths('usr/local/lib/R/site-library/')
+library(psych, include.only = "pairs.panels")  # only load one function
+library(tidyverse)
+library(bayesplot)
+library(posterior)
+library(rstan)
+library(HDInterval)
+library(loo)
+library(gridExtra)
+
+theme_set(theme_classic() +
+    theme(panel.grid.major.y = element_line(color = "grey92")))
+```
+
+```{r}
+#load arrests and incidents
+arrests_all <- read.csv('Arrests_All.csv')
+incidents_all <- read.csv('Incidents_All.csv')
+```
+
+```{r}
+#instructions from Kaggle
+arrests_all$INCIDENT.NO <- sub("^SJ.{4}", "", arrests_all$GO.NO)
+#only consider arrests with known corresponding incident 
+all <- merge(arrests_all, incidents_all, by = "INCIDENT.NO", all.x = FALSE, all.y = FALSE)
+all$YEAR <- as.integer(str_sub(all$RPT.DATE, start = -4))
+```
+
+
+```{r}
+head(all, 3)
+```
+
+
+
+```{r}
+#very few are not M or F -> remove
+print(table(all$SEX))
+null <- nrow(all[(all$SEX != 'M') & (all$SEX != 'F'), ])
+null / nrow(all) #very small proportion is not M/F
+```
+```{r}
+print(table(all$RACE))
+print(table(all$ETHNICITY))
+#use race for analysis, less missing
+```
+
+```{r}
+#checks on the data:
+all <- all %>%
+  dplyr::select(PIN, AGE, SEX, RACE, RPT.TIME, RPT.DATE,
+                INCIDENT.NO, INCIDENT.DESCRIPTION, YEAR) 
+
+```
+
+```{r}
+#all
+#pairs.panels(all, ellipses = FALSE)
+```
+
+
+```{r}
+#use decade instead of age for ppc
+#table(df$DECADE, useNA = "ifany")
+all$DECADE <- (all$AGE %/% 10) * 10
+all <- all[!is.na(all$DECADE), ]
+table(all$DECADE, useNA = "ifany")
+```
+
+```{r}
+#group race for ppc, given in San Jose Kaggle 
+race_codes <- read.csv('Race_Codes.csv')
+race_groups <- read.csv('Race_Groups.csv')
+all <- dplyr::rename(all, CODE = RACE)
+all <- merge(all, race_codes, by = "CODE")
+all <- merge(all, race_groups, by = "RACE")
+
+table(all$RACE_GROUP, useNA = "ifany")
+
+all <- all %>%
+  filter(!is.na(RACE_GROUP))  %>%
+  filter((SEX == 'M') | (SEX == 'F'))
+```
+```{r}
+colnames(all)
+```
+
+```{r}
+#unique(all[all$YEAR == 2022, ]$RPT.DATE)
+```
+
+```{r}
+#we have 2015, 2016, 2017, 2019, 2020 (missing 2018, 2022 is incomplete)
+df <- all[(all$YEAR != 2021) & (all$YEAR != 2022), ]
+
+#leave out 2021 for prediction 
+df2021 <- all[all$YEAR == 2021, ]
+```
+
+```{r}
+par(mfrow = c(1, 2))
+barplot(table(df[df$SEX == 'F', ]$RACE_GROUP),
+        main = "Female",
+        col = "pink",
+        las = 2)  
+barplot(table(df[df$SEX == 'M', ]$RACE_GROUP),
+        main = "Male",
+        col = "lightblue",
+        las = 2)
+par(mfrow = c(1, 1))
+```
+
+```{r}
+ggplot(df, aes(x = AGE, fill = SEX)) +
+  geom_histogram(binwidth = 5, color = "black", alpha = 0.7) + 
+  facet_wrap(~SEX, nrow = 1) +                                   
+  scale_fill_manual(values = c("F" = "pink", "M" = "lightblue")) +
+  theme_minimal(base_size = 14) +
+  theme(
+    legend.position = "none",                                     
+    strip.text = element_text(face = "bold", size = 14)        
+  ) +
+  labs(
+    x = "Age",
+    y = "Count",
+    title = "Age Distribution by Sex"
+  )
+
+ggsave("age_sex_histograms.png", width = 10, height = 5, dpi = 300)
+```
+
+```{r}
+df <- df %>%
+  dplyr::select(PIN, INCIDENT.NO, AGE, SEX, RACE_GROUP, RPT.TIME,
+                INCIDENT.DESCRIPTION, YEAR, DECADE) 
+
+df[sample(nrow(df), 3), ]
+```
+
+## One-Param
+### Conjugacy (Closed Form)
+
+Data summarized:
+
+```{r}
+n_female <- nrow(df[(df$SEX == 'F'), ])
+ntotal <- nrow(df)
+paste ("mean of data: ", n_female / ntotal)
+paste("total rows:", ntotal)
+```
+
+
+
+
+Posterior $\theta \sim \text{Beta}(2 + \sum y_i, 7 + n - \sum y_i)$ 
+
+```{r}
+#Beta Prior with ~22% E[X] -- (National Bureau of Justice Statistics).
+
+
+set.seed(321)
+closed_theta <- rbeta(1000, shape1 = 2 + n_female, shape2 = 7 + ntotal - n_female)
+
+# use the 'posterior' package
+posterior::as_draws(tibble(theta = closed_theta)) %>%
+  summarize_draws()
+
+```
+
+### MCMC Stan / Convergence
+
+```{r, results='hide', message=FALSE, warning=FALSE}
+data_bin <- list(N = ntotal, y = n_female)
+code_bin <- "binom.stan"
+fit_bin_mcmc <- stan(file = code_bin, data = data_bin,
+                 chains = 4, seed = 321, iter = 2000,
+                 refresh = 0)
+
+#monitor(fit_bin)
+```
+
+```{r}
+print(fit_bin_mcmc, pars = "theta")
+```
+
+The chain did converge because R-hat = 1.
+
+### MCMC with Hyperparameter Search for Beta Prior
+
+
+```{r}
+#do a hyperparameter search for best beta prior to use with the same expected value (~0.22)
+hyperparams <- list(
+ alphas = c(2, 10, 22, 154),
+ betas = c(7, 45, 78, 700)
+)
+```
+
+```{r, results='hide', message=FALSE, warning=FALSE}
+prior_fits <- vector(mode = "list", length = 4)
+
+for(i in 1:4) {
+  data_bin <- list(N = ntotal, y = n_female, 
+                   alpha = hyperparams$alphas[i], beta = hyperparams$betas[i])
+  prior_fits[[i]] <- stan(file = "hyper_binom.stan", data = data_bin,
+                 chains = 4, seed = 321, iter = 2000,
+                 refresh = 0)
+}
+```
+
+
+## One-Param Model Posterior Checks 
+
+```{r}
+#get samples from conjugacy:
+hist(closed_theta)
+
+#mcmc
+mcmc_hist(fit_bin_mcmc, pars = 'theta')
+```
+
+```{r}
+print("closed form")
+summary(closed_theta)
+
+print("MCMC")
+mcmc_posterior <- rstan::extract(fit_bin_mcmc)
+summary(mcmc_posterior$theta)
+```
+
+
+```{r}
+hdi(closed_theta, credMass = 0.90) 
+```
+
+```{r}
+hdi(mcmc_posterior$theta, credMass = 0.90) 
+```
+
+```{r}
+#do a posterior check on decade:
+ppc <- function(df, theta_samples, group) {
+  y_tilde <- matrix(NA,
+                    nrow = length(theta_samples),
+                    ncol = length(df$SEX))
+  
+  y_tilde <- t(sapply(theta_samples, function(theta_s) {
+      rbinom(length(df$SEX), 1, theta_s)
+  }))
+    
+    
+  bayesplot::ppc_stat_grouped(
+      as.numeric(df$SEX == "F"),
+      yrep = y_tilde,
+      group = df[[group]]
+  )
+}
+```
+
+```{r}
+ppc(df, closed_theta, "DECADE")
+```
+
+```{r}
+ppc(df, sample(mcmc_posterior$theta, 1000, replace=FALSE), "DECADE")
+```
+
+
+
+
+```{r}
+#ppc on race
+ppc(df, closed_theta, "RACE_GROUP")
+```
+
+```{r}
+ppc(df, sample(mcmc_posterior$theta, 1000, replace=FALSE), "RACE_GROUP")
+```
+
+
+```{r}
+results <- tibble(
+  alpha = numeric(),
+  beta  = numeric(),
+  mean_theta = numeric(),
+  sd_theta   = numeric(),
+  hdi_lower  = numeric(),
+  hdi_upper  = numeric()
+)
+
+for (i in 1:4) {
+  alpha_i <- hyperparams$alphas[i]
+  beta_i  <- hyperparams$betas[i]
+  
+  posterior <- rstan::extract(prior_fits[[i]])
+  
+  mean_theta <- mean(posterior$theta)
+  sd_theta   <- sd(posterior$theta)
+  hdi_vals   <- hdi(posterior$theta, ci = 0.90)
+  
+ 
+  results <- results %>%
+    add_row(
+      alpha      = alpha_i,
+      beta       = beta_i,
+      mean_theta = round(mean_theta, 3),
+      sd_theta   = round(sd_theta, 3),
+      hdi_lower  = round(hdi_vals[["lower"]], 3),
+      hdi_upper  = round(hdi_vals[["upper"]], 3)
+    )
+}
+
+print(results)
+```
+
+
+
+
+## Hierarchical (Time, Race, Decade)
+### Time
+```{r}
+#use time -> convert time to hourly 
+df$RPT.TIME24HR <- floor(df$RPT.TIME / 100)
+
+
+female_only <- df[df$SEX == 'F', ]
+male_only <- df[df$SEX == 'M', ]
+
+N = table(df$RPT.TIME24HR) #24 blocks
+N
+```
+
+
+
+```{r}
+#y is the counts of female in each block 
+y = table(female_only$RPT.TIME24HR) 
+y
+```
+
+
+```{r, results='hide', message=FALSE, warning=FALSE}
+#fit
+data_hier_bin <- list(J = 24, N = as.integer(N), y = as.integer(y))
+code_bin <- "hier_bin.stan"
+hier_fit_time <- stan(file = code_bin, data = data_hier_bin,
+                 chains = 4, seed = 321, iter = 2000,
+                 refresh = 0)
+
+#monitor(hier_fit_time)
+```
+
+### Incident Type
+```{r}
+#incident type
+print(sort(table(df$INCIDENT.DESCRIPTION), decreasing = TRUE)[0:10])
+length(table(df$INCIDENT.DESCRIPTION))
+
+print(sort(table(female_only$INCIDENT.DESCRIPTION), decreasing = TRUE)[0:10])
+length(table(female_only$INCIDENT.DESCRIPTION))
+
+print(sort(table(male_only$INCIDENT.DESCRIPTION), decreasing = TRUE)[0:10])
+length(table(male_only$INCIDENT.DESCRIPTION))
+```
+
+
+
+### Race
+
+```{r}
+N = table(df$RACE_GROUP) #6 blocks
+N
+```
+
+Use the race group blocks as the hierarchical model (6) by adding parameter $\kappa$ which represents the overall concentration, and is specified by
+
+$$\kappa \sim \text{Gamma}(0.01, 0.01)$$
+
+```{r}
+#y is the counts of female in each block 
+y = table(female_only$RACE_GROUP) 
+y
+```
+
+```{r, results='hide', message=FALSE, warning=FALSE}
+#fit
+data_hier_bin <- list(J = 6, N = as.integer(N), y = as.integer(y))
+code_bin <- "hier_bin.stan"
+hier_fit_race <- stan(file = code_bin, data = data_hier_bin,
+                 chains = 4, seed = 321, iter = 2000,
+                 refresh = 0)
+
+#monitor(hier_fit_race)
+```
+
+### Decade
+
+```{r}
+sort(table(df$DECADE), decreasing = TRUE)
+```
+
+```{r}
+N = table(df$DECADE) #10 blocks
+N
+```
+
+Use the decade blocks as the hierarchical model (10) by adding parameter $\kappa$.
+
+```{r}
+#y is the counts of female in each block 
+y = table(female_only$DECADE) 
+y
+```
+
+```{r, results='hide', message=FALSE, warning=FALSE}
+#fit
+data_hier_bin <- list(J = 10, N = as.integer(N), y = as.integer(y))
+code_bin <- "hier_bin.stan"
+hier_fit_decade <- stan(file = code_bin, data = data_hier_bin,
+                 chains = 4, seed = 321, iter = 2000,
+                 refresh = 0)
+
+#monitor(hier_fit_decade)
+```
+
+## Hierarchical Model Posterior Checks 
+
+
+```{r}
+#time
+print(hier_fit_time, pars = "theta")
+```
+
+```{r}
+print(hier_fit_time, pars = "mu")
+
+print(hier_fit_time, pars = "kappa")
+```
+
+
+
+The hierarchical model fit is better because the Rhats are all 1 and it fits the data with more description.
+
+
+```{r}
+ppc_hier_time <- function(df, theta_hour_row, hour, group) {
+  set.seed(321)
+  print(hour)
+  curr_rows <- df[df$RPT.TIME24HR == hour, ]
+
+  y_tilde <- matrix(NA,
+                    nrow = length(theta_hour_row),
+                    ncol = length(curr_rows$SEX))
+  
+ 
+  y_tilde <- t(sapply(theta_hour_row, function(theta_s) {
+      rbinom(length(curr_rows$SEX), 1, theta_s)
+  }))
+  
+  bayesplot::ppc_stat_grouped(
+      y = as.numeric(curr_rows$SEX == 'F'),
+      yrep = y_tilde,
+      group = curr_rows[[group]]
+  )
+}
+```
+
+```{r}
+posterior <- rstan::extract(hier_fit_time)
+s_thetas <- t(posterior$theta)
+
+
+#for (i in 1:24) {
+#  theta_row <- s_thetas[i, ]
+#  sample <- sample(theta_row, 100, replace = FALSE)
+#  ppc_hier_time(incident_arrests, sample, i - 1, "DECADE") #sample of theta values for a specific time block
+#}
+```
+
+```{r}
+hour = 14 #20, 7
+#hour 1 is midnight-1am, hour 5 is 4am-5am, etc. 
+theta_row <- s_thetas[hour, ]
+sample <- sample(theta_row, 100, replace = FALSE)
+ppc_hier_time(df, sample, hour - 1, "DECADE") 
+ppc_hier_time(df, sample, hour - 1, "RACE_GROUP") 
+```
+
+
+
+
+```{r}
+#race
+print(hier_fit_race, pars = "theta")
+```
+
+```{r}
+print(hier_fit_race, pars = "mu")
+
+print(hier_fit_race, pars = "kappa")
+```
+
+```{r}
+ppc_hier_race <- function(df, theta_race_group_row, race_group) {
+  set.seed(321)
+  print(race_group) 
+  curr_rows <- df[df$RACE_GROUP == race_group, ]
+
+  y_tilde <- matrix(NA,
+                    nrow = length(theta_race_group_row),
+                    ncol = length(curr_rows$SEX))
+  
+ 
+  y_tilde <- t(sapply(theta_race_group_row, function(theta_s) {
+      rbinom(length(curr_rows$SEX), 1, theta_s)
+  }))
+  
+  bayesplot::ppc_stat_grouped(
+      y = as.numeric(curr_rows$SEX == 'F'),
+      yrep = y_tilde,
+      group = curr_rows$DECADE
+  )
+}
+
+```
+
+```{r}
+race_groups <- list(`1` = "AFRICAN AMERICAN", `2` = "ASIAN/PACIFIC ISLANDER", `3` = "CAUCASIAN",
+                    `4` = "HISPANIC/LATIN/MEXICAN", `5` = "OTHER", `6` = "UNKNOWN")
+posterior <- rstan::extract(hier_fit_race)
+s_thetas <- t(posterior$theta)
+race_group = 1
+theta_row <- s_thetas[race_group, ] 
+sample <- sample(theta_row, 100, replace = FALSE)
+ppc_hier_race(df, sample, race_groups[[race_group]]) 
+```
+
+
+```{r}
+#decade
+print(hier_fit_decade, pars = "theta")
+```
+
+```{r}
+print(hier_fit_decade, pars = "mu")
+
+print(hier_fit_decade, pars = "kappa")
+```
+
+```{r}
+ppc_hier_decade <- function(df, theta_decade_row, decade) {
+  set.seed(321)
+  print(decade)
+  curr_rows <- df[df$DECADE == decade, ]
+
+  y_tilde <- matrix(NA,
+                    nrow = length(theta_decade_row),
+                    ncol = length(curr_rows$SEX))
+  
+ 
+  y_tilde <- t(sapply(theta_decade_row, function(theta_s) {
+      rbinom(length(curr_rows$SEX), 1, theta_s)
+  }))
+  
+  bayesplot::ppc_stat_grouped(
+      y = as.numeric(curr_rows$SEX == 'F'),
+      yrep = y_tilde,
+      group = curr_rows$RACE_GROUP
+  )
+}
+
+```
+
+```{r}
+posterior <- rstan::extract(hier_fit_decade)
+s_thetas <- t(posterior$theta)
+age_group = 5 #1 is ages 0-10, 2 is ages 10-20 ... 10 is ages 90-100
+theta_row <- s_thetas[age_group, ] 
+sample <- sample(theta_row, 100, replace = FALSE)
+ppc_hier_decade(df, sample, (age_group - 1) * 10) 
+
+```
+
+
+
+## Sequential Bayes Model
+
+
+```{r, results='hide', message=FALSE, warning=FALSE}
+fits <- vector(mode = "list", length = 5)
+years <- list(`1` = 2015, `2` = 2016, `3` = 2017,
+              `4` = 2019, `5` = 2020) #there is no data for 2018
+
+for (i in 1:5) {
+  set.seed(321)
+  curr_df <- df[df$YEAR == years[[i]], ]
+  N <- table(curr_df$RPT.TIME24HR)
+  y <- table(curr_df[curr_df$SEX == 'F', ]$RPT.TIME24HR) 
+  
+  if (i == 1) { #2015
+    file = "hier_bin.stan"
+    data =  list(J = 24, N = as.integer(N), y = as.integer(y)) 
+  }
+ 
+  
+  else {
+    prior <- rstan::extract(fits[[i - 1]])
+    theta_priors <- colMeans(prior$theta)
+    data = list(J = 24, N = as.integer(N), y = as.integer(y), mus = theta_priors)
+    file = "hier_seq_bin.stan"
+   
+    
+  }
+  print(paste("Fitting year", years[[i]]))
+  #fit new model
+  fits[[i]] <-  stan(file = file, data = data,
+                 chains = 4, seed = 321, iter = 2000,
+                 refresh = 0)
+  
+}
+```
+
+
+
+## Sequential Bayes Model Posterior Checks
+
+```{r}
+#take a look at final model + posterior done from 2020 data
+#look at fits especially the last one
+fit2020 <- fits[[5]]
+print(fit2020, pars = "theta")
+print(fit2020, pars = "kappa")
+```
+
+
+
+```{r}
+posterior <- rstan::extract(fit2020)
+s_thetas <- t(posterior$theta)
+
+#for (i in 1:24) {
+#  theta_row <- s_thetas[i, ]
+#  sample <- sample(theta_row, 100, replace = FALSE)
+#  ppc_hier_time(incident_arrests, sample, i - 1, "DECADE") #sample of theta values for a specific time block
+#}
+```
+
+```{r}
+hour = 14 #20, 7
+theta_row <- s_thetas[hour, ]
+sample <- sample(theta_row, 100, replace = FALSE)
+ppc_hier_time(df[df$YEAR == 2020, ], sample, hour - 1, "DECADE") 
+ppc_hier_time(df[df$YEAR == 2020, ], sample, hour - 1, "RACE_GROUP") 
+```
+
+
+## Final Models Evaluation
+### Runtimes Check
+```{r, results='hide', message=FALSE, warning=FALSE}
+set.seed(321)
+### Runtimes of Closed form, (1) MCMC, MCMC Hyperparameter Search (prior), 
+#3 Hierarchical Models, 1 Sequential Model
+
+#closed form runtime:
+closed <- function(df) {
+  closed_theta <- rbeta(3000, shape1 = 2 + nrow(df[(df$SEX == 'F'), ]), 
+                        shape2 = 7 + nrow(df) - nrow(df[(df$SEX == 'F'), ]))
+  return (closed_theta)
+}
+
+#mcmc runtime 
+mcmc_fit <- function(df) {
+  fit_bin <- stan(file = "binom.stan", data = list(N = nrow(df), 
+                 y = nrow(df[(df$SEX == 'F'), ])),
+                 chains = 4, seed = 321, iter = 2000,
+                 verbose = FALSE, refresh=0)
+  return (fit_bin)
+}
+
+#hyperparameter check time
+hyperparam_fit <- function(hyperparams, df) {
+  prior_fits <- vector(mode = "list", length = 4)
+
+  for(i in 1:4) {
+    data_bin <- list(N = nrow(df), y = nrow(df[(df$SEX == 'F'), ]), 
+                     alpha = hyperparams$alphas[i], beta = hyperparams$betas[i])
+    prior_fits[[i]] <- stan(file = "hyper_binom.stan", data = data_bin,
+                   chains = 4, seed = 321, iter = 2000,
+                   refresh = 0)
+  }
+  return(prior_fits)
+}
+
+#Hierarchical time
+hier_time_fit <- function(df, group) {
+  J = length(table(df[[group]]))
+  N = table(df[[group]])
+  y = table(df[df$SEX == 'F', ][[group]])
+  data_hier_bin <- list(J = J, N = as.integer(N), y = as.integer(y))
+  hier_fit <- stan(file = "hier_bin.stan", data = data_hier_bin,
+                 chains = 4, seed = 321, iter = 2000,
+                 refresh = 0)
+  return(hier_fit)
+  
+}
+
+seq_time_fit <- function(years, df) {
+  fits <- vector(mode = "list", length = 5)
+
+  for (i in 1:5) {
+    curr_df <- df[df$YEAR == years[[i]], ]
+    N <- table(curr_df$RPT.TIME24HR)
+    y <- table(curr_df[curr_df$SEX == 'F', ]$RPT.TIME24HR) 
+    
+    if (i == 1) { #2015
+      file = "hier_bin.stan"
+      data =  list(J = 24, N = as.integer(N), y = as.integer(y)) 
+    }
+   
+    
+    else {
+      prior <- rstan::extract(fits[[i - 1]])
+      theta_priors <- colMeans(prior$theta)
+      data = list(J = 24, N = as.integer(N), y = as.integer(y), mus = theta_priors)
+      file = "hier_seq_bin.stan"
+     
+      
+    }
+    print(paste("Fitting year", years[[i]]))
+    #fit new model
+    fits[[i]] <-  stan(file = file, data = data,
+                   chains = 4, seed = 321, iter = 2000,
+                   refresh = 0)
+  }
+  
+  return(fits)
+}
+
+
+closed_theta_time <- system.time(closed_theta <- closed(df))
+
+mcmc1fit_time <- system.time(mcmc1 <- mcmc_fit(df))
+
+hyperparams <- list(alphas = c(2, 10, 22, 154),
+                    betas = c(7, 45, 78, 700))
+
+mcmc_hyperparam_time <- system.time(mcmc_hps <- hyperparam_fit(hyperparams, df))
+
+hier_hour_time <- system.time(hier_24hr <- hier_time_fit(df, "RPT.TIME24HR"))
+hier_race_time <- system.time(hier_race <- hier_time_fit(df, "RACE_GROUP"))
+hier_age_time <- system.time(hier_age <- hier_time_fit(df, "DECADE"))
+
+years <- list(`1` = 2015, `2` = 2016, `3` = 2017,
+              `4` = 2019, `5` = 2020)
+sequential_time <- system.time(seq_hiers <- seq_time_fit(years, df))
+```
+
+```{r}
+all_times <- rbind(closed_theta_time, mcmc1fit_time, mcmc_hyperparam_time,
+                   hier_hour_time, hier_race_time, hier_age_time, sequential_time)
+
+all_times
+```
+
+### Prediction
+```{r}
+# Look at WAIC and LOOCV (LOOCV less unstable)
+
+eval <- function(fit) {
+  log_lik <- rstan::extract(fit)$log_lik
+  if (length(dim(log_lik)) == 1) {
+    log_lik <- matrix(log_lik, ncol = 1)
+  }
+  #waic_res <- waic(log_lik)
+  loocv <- loo(log_lik)
+  #print(waic_res)
+  return(loocv)
+}
+
+
+#eval(seq_hiers[[5]]) 
+```
+
+```{r}
+all_fits <- list(fits = c(mcmc1, mcmc_hps[[2]], mcmc_hps[[3]], mcmc_hps[[4]],
+                   hier_24hr, hier_race, hier_age, seq_hiers[[5]]),
+                   names = c("MCMC (2, 7)", "MCMC (10, 45)", "MCMC (22, 78)", "MCMC (154, 700)", 
+                            "Hierarchical by Hour", "Hierarchical by Race", 
+                            "Hierarchical by Age (10s)", "Sequential + Hierarchical by Hour"))
+
+
+
+results <- data.frame(
+  Model = character(),
+  ELPD_LOO = numeric(),
+  P_LOO = numeric(),
+  LOOIC = numeric()
+)
+
+```
+
+```{r}
+for (i in 1:length(all_fits$fits)) {
+  res <- eval(all_fits$fits[[i]])
+  row <- (res$estimates)[, 1]
+  add <- data.frame(Model = all_fits$names[i], ELPD_LOO = as.double(row["elpd_loo"]),
+           P_LOO = as.double(row["p_loo"]), LOOIC = as.double(row["looic"]))
+  
+  results <- rbind(results, add)
+}
+
+#for each fit in all_fits, run eval(fit) and combine them all (all dfs) 
+```
+
+```{r}
+results
+```
+
+
+```{r}
+#prediction on 2021 dataset
+pred <- function(fit, dfnew, group = NULL) {
+  posterior <- extract(fit)
+  theta <- posterior$theta
+  
+  if (!is.null(group)) {
+    N2021 <- as.integer(table(dfnew[[group]]))
+    #print(dfnew)
+    n_groups <- length(N2021)
+  } 
+  
+  else {
+    N2021 <- nrow(dfnew)
+    n_groups <- 1
+  }
+  
+  n_draws <- nrow(theta)
+  yrep_2021 <- matrix(
+  rbinom(n_draws * n_groups,
+         size = rep(N2021, each = n_draws),
+         prob = as.vector(theta)),
+  nrow = n_draws,
+  ncol = n_groups
+  )
+  
+  #yhat_2021 <- colMeans(yrep_2021) #means
+  return (yrep_2021)
+}
+```
+
+
+
+```{r}
+#sequential 
+df2021$RPT.TIME24HR <- floor(df2021$RPT.TIME / 100)
+
+yrep_2021 <- pred(seq_hiers[[5]], df2021, group = "RPT.TIME24HR")
+y2021 <- as.integer(table(df2021[df2021$SEX == 'F', ][["RPT.TIME24HR"]]))
+
+par(mfrow = c(2,4)) #can change to add more
+for (j in 1:8) { #can change to add more
+  hist(yrep_2021[, j],
+       main = paste0("Hour ", j-1),
+       xlab = "Female arrests",
+       col = "lightblue",
+       border = "white",
+       breaks = 30)
+  
+  abline(v = y2021[j], col = "red", lwd = 2)  # observed value
+}
+```
+```{r}
+#sequential 
+df2021$RPT.TIME24HR <- floor(df2021$RPT.TIME / 100)
+
+yrep_2021 <- pred(seq_hiers[[5]], df2021, group = "RPT.TIME24HR")
+y2021 <- as.integer(table(df2021[df2021$SEX == 'F', ][["RPT.TIME24HR"]]))
+
+par(mfrow = c(2,4)) #can change to add more
+for (j in 9:16) { #can change to add more
+  hist(yrep_2021[, j],
+       main = paste0("Hour ", j-1),
+       xlab = "Female arrests",
+       col = "lightblue",
+       border = "white",
+       breaks = 30)
+  
+  abline(v = y2021[j], col = "red", lwd = 2)  # observed value
+}
+```
+
+```{r}
+#sequential 
+df2021$RPT.TIME24HR <- floor(df2021$RPT.TIME / 100)
+
+yrep_2021 <- pred(seq_hiers[[5]], df2021, group = "RPT.TIME24HR")
+y2021 <- as.integer(table(df2021[df2021$SEX == 'F', ][["RPT.TIME24HR"]]))
+
+par(mfrow = c(2,4)) #can change to add more
+for (j in 17:24) { #can change to add more
+  hist(yrep_2021[, j],
+       main = paste0("Hour ", j-1),
+       xlab = "Female arrests",
+       col = "lightblue",
+       border = "white",
+       breaks = 30)
+  
+  abline(v = y2021[j], col = "red", lwd = 2)  # observed value
+}
+```
+
+```{r}
+#regular hierarchical on time
+yrep_2021 <- pred(hier_24hr, df2021, group = "RPT.TIME24HR")
+y2021 <- as.integer(table(df2021[df2021$SEX == 'F', ][["RPT.TIME24HR"]]))
+
+par(mfrow = c(2,4)) 
+for (j in 1:8) {
+  hist(yrep_2021[, j],
+       main = paste0("Hour ", j-1),
+       xlab = "Female arrests",
+       col = "lightblue",
+       border = "white",
+       breaks = 30)
+  
+  abline(v = y2021[j], col = "red", lwd = 2)  # observed value
+}
+```
+
+```{r}
+#hierarchical on race
+yrep_2021 <- pred(hier_race, df2021, group = "RACE_GROUP")
+y2021 <- as.integer(table(df2021[df2021$SEX == 'F', ][["RACE_GROUP"]]))
+race_groups <- list(`1` = "AFRICAN AMERICAN", `2` = "ASIAN/PACIFIC ISLANDER", `3` = "CAUCASIAN",
+                    `4` = "HISPANIC/LATIN/MEXICAN", `5` = "OTHER", `6` = "UNKNOWN")
+
+par(mfrow = c(2,3))  
+for (j in 1:6) {
+  hist(yrep_2021[, j],
+       main = paste0("Race: ", race_groups[[j]]),
+       xlab = "Female arrests",
+       col = "lightblue",
+       border = "white",
+       breaks = 30)
+  
+  abline(v = y2021[j], col = "red", lwd = 2)  # observed value
+  
+}
+```
+
+```{r}
+table(df2021[df2021$SEX == 'F', ][["RACE_GROUP"]])
+```
+
+```{r}
+#one params
+yrep_2021small <- pred(mcmc_hps[[2]], df2021)
+y2021 <- nrow(df2021[df2021$SEX == 'F', ])
+print(y2021)
+
+par(mfrow = c(1,1))  
+for (j in 1:1) {
+  hist(yrep_2021small[, j],
+       main = paste0("Beta(2,7)"),
+       xlab = "Female arrests",
+       col = "lightblue",
+       border = "white",
+       breaks = 30)
+  
+  abline(v = y2021, col = "red", lwd = 2)  # observed value
+}
+
+yrep_2021big <- pred(mcmc_hps[[4]], df2021)
+par(mfrow = c(1,1))  
+for (j in 1:1) {
+  hist(yrep_2021big[, j],
+       main = paste0("Beta(154, 700)"),
+       xlab = "Female arrests",
+       col = "lightblue",
+       border = "white",
+       breaks = 30)
+  
+  abline(v = y2021, col = "red", lwd = 2)  # observed value
+}
+```
+
+```{r}
+y2021 <- nrow(df2021[df2021$SEX == 'F', ])
+N2021 <- nrow(df2021)
+n_groups = 1
+n_draws <- length(closed_theta)
+
+yrep_2021 <- rbinom(n = n_draws, size = N2021, prob = closed_theta)
+yrep_2021 <- matrix(yrep_2021, nrow = n_draws, ncol = 1)
+
+par(mfrow = c(1,1))  
+for (j in 1:1) {
+  hist(yrep_2021[, j],
+       main = paste0("Beta(154, 700)"),
+       xlab = "Female arrests",
+       col = "lightblue",
+       border = "white",
+       breaks = 30)
+  
+  abline(v = y2021, col = "red", lwd = 2)  # observed value
+}
+```
+```{r}
+print(y2021)
+y2021 / N2021 #less than before
+```
+
+
